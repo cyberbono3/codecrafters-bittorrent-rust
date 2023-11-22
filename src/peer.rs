@@ -2,6 +2,79 @@ use bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::Decoder;
 use tokio_util::codec::Encoder;
 
+pub(crate) struct Peer {
+    addr: SocketAddrV4,
+    stream: Framed<TcpStream, MessageFramer>,
+    bitfield: Bitfield,
+}
+
+impl Peer {
+    pub async fn new(peer_addr: SocketAddrV4, info_hash: [u8; 20]) -> anyhow::Result<Self> {
+        let mut peer = tokio::net::TcpStream::connect(peer_addr)
+            .await
+            .context("connect to peer")?;
+        let mut handshake = Handshake::new(info_hash, *b"00112233445566778899");
+        {
+            let handshake_bytes = handshake.as_bytes_mut();
+            peer.write_all(handshake_bytes)
+                .await
+                .context("write handshake")?;
+            peer.read_exact(handshake_bytes)
+                .await
+                .context("read handshake")?;
+        }
+        anyhow::ensure!(handshake.length == 19);
+        anyhow::ensure!(&handshake.bittorrent == b"BitTorrent protocol");
+        let mut peer = tokio_util::codec::Framed::new(peer, MessageFramer);
+        let bitfield = peer
+            .next()
+            .await
+            .expect("peer always sends a bitfields")
+            .context("peer message was invalid")?;
+        anyhow::ensure!(bitfield.tag, MessageTag::Bitfield);
+        Ok(Self {
+            addr: peer_addr,
+            stream: peer,
+            bitfield: Bitfield::from_payload(bitfield.payload),
+        })
+    }
+
+    pub async fn download(
+        &mut self,
+        piece_i: u32,
+        block_i: u32,
+        block_size: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut request = Request::new(
+            piece_i as u32,
+            (block_i * BLOCK_MAX) as u32,
+            block_size as u32,
+        );
+        let request_bytes = Vec::from(request.as_bytes_mut());
+        self.send(Message {
+            tag: MessageTag::Request,
+            payload: request_bytes,
+        })
+        .await
+        .with_context(|| format!("send request for block {block_i}"))?;
+
+        let piece = peer
+            .next()
+            .await
+            .expect("peer always sends a piece")
+            .context("peer message was invalid")?;
+        anyhow::ensure!(piece.tag == MessageTag::Piece);
+        anyhow::ensure!(!piece.payload.is_empty());
+
+        let piece = Piece::ref_from_bytes(&piece.payload[..])
+            .expect("always get all Piece response fields from peer");
+        anyhow::ensure!(piece.index() as usize == piece_i);
+        anyhow::ensure!(piece.begin() as usize == block_i * BLOCK_MAX);
+        anyhow::ensure!(piece.block().len() == block_size);
+        Ok(Vec::from(piece.block()))
+    }
+}
+
 #[repr(C)]
 pub struct Handshake {
     pub length: u8,

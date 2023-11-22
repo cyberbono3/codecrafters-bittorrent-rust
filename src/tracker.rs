@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-
+use crate::torrent::Torrent;
 pub use peers::Peers;
+use serde::{Deserialize, Serialize};
 
 /// Note: the info hash field is _not_ included.
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +41,34 @@ pub struct TrackerResponse {
     /// Each peer is represented using 6 bytes. The first 4 bytes are the peer's IP address and the
     /// last 2 bytes are the peer's port number.
     pub peers: Peers,
+}
+
+impl TrackerResponse {
+    pub(crate) async fn query(t: &Torrent) -> anyhow::Context<Self> {
+        let info_hash = t.info_hash();
+        let request = TrackerRequest {
+            peer_id: String::from("00112233445566778899"),
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: t.length(),
+            compact: 1,
+        };
+
+        let url_params =
+            serde_urlencoded::to_string(&request).context("url-encode tracker parameters")?;
+        let tracker_url = format!(
+            "{}?{}&info_hash={}",
+            t.announce,
+            url_params,
+            &urlencode(&info_hash)
+        );
+        let response = reqwest::get(tracker_url).await.context("query tracker")?;
+        let response = response.bytes().await.context("fetch tracker response")?;
+        let tracker_info: TrackerResponse =
+            serde_bencode::from_bytes(&response).context("parse tracker response")?;
+        Ok(tracker_info)
+    }
 }
 
 mod peers {
