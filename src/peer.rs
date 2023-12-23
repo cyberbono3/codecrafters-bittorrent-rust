@@ -1,11 +1,18 @@
+use anyhow::Context;
 use bytes::{Buf, BufMut, BytesMut};
-use tokio_util::codec::Decoder;
-use tokio_util::codec::Encoder;
+use futures_util::{stream::StreamExt, SinkExt};
+use std::net::SocketAddrV4;
+use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio_util::{codec::Decoder, codec::Encoder, codec::Framed};
+
+use crate::BLOCK_MAX;
 
 pub(crate) struct Peer {
     addr: SocketAddrV4,
     stream: Framed<TcpStream, MessageFramer>,
     bitfield: Bitfield,
+    choked: bool,
 }
 
 impl Peer {
@@ -31,34 +38,38 @@ impl Peer {
             .await
             .expect("peer always sends a bitfields")
             .context("peer message was invalid")?;
-        anyhow::ensure!(bitfield.tag, MessageTag::Bitfield);
+        anyhow::ensure!(bitfield.tag == MessageTag::Bitfield);
         Ok(Self {
             addr: peer_addr,
             stream: peer,
             bitfield: Bitfield::from_payload(bitfield.payload),
+            choked: true,
         })
     }
 
     pub async fn download(
         &mut self,
-        piece_i: u32,
-        block_i: u32,
+        piece_i: usize,
+        block_i: usize,
         block_size: usize,
     ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(self.bitfield.has_piece(piece_i));
         let mut request = Request::new(
             piece_i as u32,
-            (block_i * BLOCK_MAX) as u32,
+            (block_i as usize * BLOCK_MAX) as u32,
             block_size as u32,
         );
         let request_bytes = Vec::from(request.as_bytes_mut());
-        self.send(Message {
-            tag: MessageTag::Request,
-            payload: request_bytes,
-        })
-        .await
-        .with_context(|| format!("send request for block {block_i}"))?;
+        self.stream
+            .send(Message {
+                tag: MessageTag::Request,
+                payload: request_bytes,
+            })
+            .await
+            .with_context(|| format!("send request for block {block_i}"))?;
 
-        let piece = peer
+        let piece = self
+            .stream
             .next()
             .await
             .expect("peer always sends a piece")
@@ -73,6 +84,223 @@ impl Peer {
         anyhow::ensure!(piece.block().len() == block_size);
         Ok(Vec::from(piece.block()))
     }
+
+    pub(crate) fn has_piece(&self, piece_i: usize) -> bool {
+        self.bitfield.has_piece(piece_i)
+    }
+
+    pub(crate) async fn participate(
+        &mut self,
+        piece_i: usize,
+        piece_size: usize,
+        nblocks: usize,
+        submit: kanal::AsyncSender<usize>,
+        tasks: kanal::AsyncReceiver<usize>,
+        finish: tokio::sync::mpsc::Sender<Message>,
+    ) -> anyhow::Result<()> {
+        // it will continuesly receive the tasks it is gonna download
+        anyhow::ensure!(self.bitfield.has_piece(piece_i));
+
+        self.stream
+            .send(Message {
+                tag: MessageTag::Interested,
+                payload: Vec::new(),
+            })
+            .await
+            .context("send interested message")?;
+        let mut msg;
+        'task: loop {
+            while self.choked {
+                let unchoke = self
+                    .stream
+                    .next()
+                    .await
+                    .expect("peer always sends an unchoke")
+                    .context("peer message was invalid")?;
+                match unchoke.tag {
+                    MessageTag::Unchoke => {
+                        assert!(unchoke.payload.is_empty());
+                        break;
+                    }
+
+                    MessageTag::Have => {
+                        // TODO HAVE means peer should be eligible for more pieces
+                        // TODO update bitfield
+                        // TODO: add to list of peers for relevant piece
+                    }
+
+                    MessageTag::Request
+                    | MessageTag::Cancel
+                    | MessageTag::Interested
+                    | MessageTag::NotInterested => {}
+                    MessageTag::Piece => {
+                        // piece we no longer need
+                    }
+                    MessageTag::Choke => {
+                        anyhow::bail!("peer sent unchoke while unchoke");
+                    }
+                    MessageTag::Bitfield => {
+                        anyhow::bail!("peer sent bitfield after handshake has been completed");
+                    }
+                } //while
+            } // match
+
+            let Ok(block) = tasks.recv().await else {
+                break;
+            };
+
+            let block_size = if block == nblocks - 1 {
+                let md = piece_size % BLOCK_MAX;
+                if md == 0 {
+                    BLOCK_MAX
+                } else {
+                    md
+                }
+            } else {
+                BLOCK_MAX
+            };
+
+            let mut request = Request::new(
+                piece_i as u32,
+                (block * BLOCK_MAX) as u32,
+                block_size as u32,
+            );
+
+            let request_bytes = Vec::from(request.as_bytes_mut());
+
+            self.stream
+                .send(Message {
+                    tag: MessageTag::Request,
+                    payload: request_bytes,
+                })
+                .await
+                .with_context(|| format!("send request for block {block}"))?;
+
+           
+            loop {
+                // TODO: timeout and return block to submit if timed out
+                 msg = self
+                    .stream
+                    .next()
+                    .await
+                    .expect("peer always sends a piece")
+                    .context("peer message was invalid")?;
+
+                match msg.tag {
+                    MessageTag::Choke => {
+                        assert!(!msg.payload.is_empty());
+                        self.choked = true;
+                        submit.send(block).await.expect("we still have a receiver");
+                        continue 'task;
+                    }
+                    MessageTag::Piece => {
+                        let piece = Piece::ref_from_bytes(&msg.payload[..])
+                            .expect("always get all Piece response fields from peer");
+
+                        if piece.index() as usize != piece_i
+                            || piece.begin() as usize != block * BLOCK_MAX
+                        {
+                            // piece we no longer needed
+                        } else {
+                            // thr piece we are looking for
+                            // otherwise
+                            assert_eq!(piece.block().len(), block_size);
+                            break;
+                        }
+                    }
+
+                    MessageTag::Have => {
+                        // TODO HAVE means peer should be eligible for more pieces
+                        // TODO update bitfield
+                        // TODO: add to list of peers for relevant piece
+                    }
+
+                    MessageTag::Request
+                    | MessageTag::Cancel
+                    | MessageTag::Interested
+                    | MessageTag::NotInterested => {}
+                    MessageTag::Unchoke => {
+                        anyhow::bail!("peer sent unchoke while unchoke");
+                    }
+                    MessageTag::Bitfield => {
+                        anyhow::bail!("peer sent bitfield after handshake has been completed");
+                    }
+                } // match
+            } // loop
+
+            finish.send(msg).await.expect("receiver should not go away while there are active peers (us) and missing blocks {this one");
+        }
+
+        Ok(())
+    }
+}
+
+pub struct Bitfield {
+    payload: Vec<u8>,
+}
+
+impl Bitfield {
+    pub(crate) fn has_piece(&self, piece_i: usize) -> bool {
+        let byte_i = piece_i / u8::BITS as usize;
+        let bit_i = (piece_i % u8::BITS as usize) as u32;
+        let Some(&byte) = self.payload.get(byte_i) else {
+            return false;
+        };
+        // 01010010010
+        // nth bit is set
+
+        /*
+        01
+        01010010010
+        &
+        00000010000
+        00000010000
+        */
+        byte & 1u8.rotate_right(bit_i + 1) != 0
+    }
+
+    // similarly
+    pub(crate) fn pieces(&self) -> impl Iterator<Item = usize> + '_ {
+        self.payload.iter().enumerate().flat_map(|(byte_i, byte)| {
+            (0..u8::BITS).filter_map(move |bit_i| {
+                let piece_i = byte_i * (u8::BITS as usize) + (bit_i as usize);
+                let mask = 1u8.rotate_right(bit_i + 1);
+                (byte & mask != 0).then_some(piece_i)
+            })
+        })
+    }
+
+    fn from_payload(payload: Vec<u8>) -> Bitfield {
+        Self { payload }
+    }
+}
+
+#[test]
+fn bitfield_has() {
+    let bf = Bitfield {
+        payload: vec![0b10101010, 0b1010101],
+    };
+    assert!(bf.has_piece(0));
+    assert!(!bf.has_piece(1));
+    assert!(!bf.has_piece(7));
+    assert!(!bf.has_piece(8));
+    assert!(bf.has_piece(15));
+}
+#[test]
+fn bitfield_iter() {
+    let bf = Bitfield {
+        payload: vec![0b10101010, 0b1010101],
+    };
+    let mut pieces = bf.pieces();
+    assert_eq!(pieces.next(), Some(0)); // 0
+    assert_eq!(pieces.next(), Some(2));
+    assert_eq!(pieces.next(), Some(4));
+    assert_eq!(pieces.next(), Some(6));
+    assert_eq!(pieces.next(), Some(9));
+    assert_eq!(pieces.next(), Some(11));
+    assert_eq!(pieces.next(), Some(13));
+    assert_eq!(pieces.next(), Some(15));
+    assert_eq!(pieces.next(), None);
 }
 
 #[repr(C)]

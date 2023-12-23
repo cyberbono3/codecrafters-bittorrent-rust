@@ -1,4 +1,5 @@
 use crate::torrent::Torrent;
+use anyhow::Context;
 pub use peers::Peers;
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +45,8 @@ pub struct TrackerResponse {
 }
 
 impl TrackerResponse {
-    pub(crate) async fn query(t: &Torrent) -> anyhow::Context<Self> {
-        let info_hash = t.info_hash();
+    pub(crate) async fn query(t: &Torrent, info_hash: &[u8; 20]) -> anyhow::Result<Self> {
+        //let info_hash = t.info_hash();
         let request = TrackerRequest {
             peer_id: String::from("00112233445566778899"),
             port: 6881,
@@ -61,7 +62,7 @@ impl TrackerResponse {
             "{}?{}&info_hash={}",
             t.announce,
             url_params,
-            &urlencode(&info_hash)
+            &urlencode(info_hash)
         );
         let response = reqwest::get(tracker_url).await.context("query tracker")?;
         let response = response.bytes().await.context("fetch tracker response")?;
@@ -131,4 +132,13 @@ mod peers {
             serializer.serialize_bytes(&single_slice)
         }
     }
+}
+
+fn urlencode(t: &[u8; 20]) -> String {
+    let mut encoded = String::with_capacity(3 * t.len());
+    for &byte in t {
+        encoded.push('%');
+        encoded.push_str(&hex::encode(&[byte]));
+    }
+    encoded
 }

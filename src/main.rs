@@ -10,8 +10,7 @@ use sha1::{Digest, Sha1};
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const BLOCK_MAX: usize = 1 << 14;
+use bittorrent_starter_rust::{peer::*, BLOCK_MAX};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -298,7 +297,7 @@ async fn main() -> anyhow::Result<()> {
             let files = torrent.download_all().await?;
             tokio::fs::write(
                 output,
-                files.iter().next().expect("always one file").bytes(),
+                files.into_iter().next().expect("always one file").bytes(),
             )
             .await?;
         }

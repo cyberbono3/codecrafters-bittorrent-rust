@@ -1,6 +1,8 @@
 use super::download;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+use std::path::Path;
 
 pub use hashes::Hashes;
 
@@ -26,13 +28,13 @@ impl Torrent {
     }
 
     pub async fn read(file: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let dot_torrent = tokio::fs::read(file).context("read torrent file")?;
+        let dot_torrent = tokio::fs::read(file).await.context("read torrent file")?;
         let t: Torrent = serde_bencode::from_bytes(&dot_torrent).context("parse torrent file")?;
         Ok(t)
     }
 
     pub fn print_tree(&self) {
-        match self.info.keys {
+        match &self.info.keys {
             Keys::SingleFile { .. } => {
                 eprintln!("{}", self.info.name);
             }
@@ -45,14 +47,14 @@ impl Torrent {
     }
 
     pub fn length(&self) -> usize {
-        match self.info.keys {
-            Keys::SingleFile { length } => length,
+        match &self.info.keys {
+            Keys::SingleFile { length } => *length,
             Keys::MultiFile { files } => files.iter().map(|f| f.length).sum(),
         }
     }
 
     pub async fn download_all(&self) -> anyhow::Result<download::Downloaded> {
-        download::all(self)
+        download::all(self).await
     }
 }
 
